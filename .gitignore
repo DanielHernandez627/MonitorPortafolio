@@ -1,0 +1,19 @@
+# Archivos locales de n8n y entorno
+.env
+.n8n/
+*.log
+
+# Python / Entornos virtuales
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+
+# Respaldo de credenciales o certificados
+*.pem
+*.key
+credentials*.json

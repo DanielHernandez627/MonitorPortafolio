@@ -1,0 +1,376 @@
+{
+  "name": "WF-Monitoreo-Portafolio-Dinamico",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8-16 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "node-trigger",
+      "name": "Trigger Horario (L-V 8-16 COT)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [160, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "mode": "id",
+          "value": "TU_GOOGLE_SHEET_ID_AQUI"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Portafolio_Base"
+        },
+        "options": {}
+      },
+      "id": "node-read-sheets",
+      "name": "1. Leer Portafolio_Base (Dinamico)",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [360, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REEMPLAZAR_CON_TU_CREDENTIAL_ID_GOOGLE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ═══════════════════════════════════════════════════════════\n// FILTRAR Y PREPARAR TICKERS DINÁMICAMENTE DESDE LA HOJA\n// ═══════════════════════════════════════════════════════════\n\nconst rows = $input.all();\nconst validStocks = [];\n\nfor (const r of rows) {\n  const row = r.json;\n  const ticker = (row.Ticker || '').trim();\n  \n  // Ignorar fila de totales o vacías\n  if (!ticker || ticker.toLowerCase().includes('total')) {\n    continue;\n  }\n\n  // Prioridad: Columna DIR_COTIZACION. Si viene vacía, fallback a Ticker + .CL\n  let symbol = (row.DIR_COTIZACION || '').trim();\n  if (!symbol) {\n    symbol = row.Mercado === 'USD' ? ticker : `${ticker}.CL`;\n  }\n\n  const qty = parseFloat(row.Cantidad) || 1;\n  const precioActualPrevio = parseFloat(row['Precio Mercado Actual']) || 0;\n  const trm = parseFloat(row.TRM) || 1;\n  const moneda = (row.Moneda || 'COP').toUpperCase();\n  const costoOrigen = parseFloat(row['Inversión Inicial (Moneda Origen)']) || (parseFloat(row['Precio Promedio Compra']) * qty) || 0;\n\n  validStocks.push({\n    json: {\n      Ticker: ticker,\n      DIR_COTIZACION: symbol,\n      Nombre: row.Nombre || ticker,\n      Mercado: row.Mercado || 'BVC',\n      Moneda: moneda,\n      TRM: trm,\n      Cantidad: qty,\n      precioActualPrevio: precioActualPrevio,\n      costoOrigen: costoOrigen,\n      url: `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1d`\n    }\n  });\n}\n\nreturn validStocks;"
+      },
+      "id": "node-filter-stocks",
+      "name": "2. Preparar Consultas Yahoo",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [560, 300]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "User-Agent",
+              "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "node-http-yahoo",
+      "name": "3. Consultar Yahoo Finance",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [760, 300],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1500
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ═══════════════════════════════════════════════════════════\n// PROCESAR RESPUESTAS Y UNIFICAR VALORIZACIÓN BIMONEDA\n// ═══════════════════════════════════════════════════════════\n\nconst stockItems = $('2. Preparar Consultas Yahoo').all();\nconst httpResponses = $input.all();\nconst now = new Date();\nconst fechaHora = now.toLocaleString('sv-SE', { timeZone: 'America/Bogota' }).replace('T', ' ');\n\nconst processedList = [];\n\nfor (let i = 0; i < stockItems.length; i++) {\n  const stock = stockItems[i].json;\n  const resp = httpResponses[i]?.json;\n\n  let livePrice = stock.precioActualPrevio;\n  let prevClose = stock.precioActualPrevio;\n  let variacionPct = 0;\n  let variacionDivisa = 0;\n  let volumen = 0;\n\n  if (resp?.chart?.result?.[0]?.meta) {\n    const meta = resp.chart.result[0].meta;\n    const apiPrice = meta.regularMarketPrice;\n    const apiClose = meta.chartPreviousClose || meta.previousClose || apiPrice;\n\n    if (typeof apiPrice === 'number' && apiPrice > 0) {\n      livePrice = apiPrice;\n      prevClose = apiClose;\n      variacionDivisa = Math.round((livePrice - prevClose) * 100) / 100;\n      if (prevClose > 0) {\n        variacionPct = Math.round(((livePrice - prevClose) / prevClose) * 10000) / 10000;\n      }\n      volumen = meta.regularMarketVolume || 0;\n    }\n  }\n\n  // Conversión homogénea a COP para el resumen patrimonial\n  const factorTRM = stock.Moneda === 'USD' ? (stock.TRM || 4150) : 1;\n  const valorMercadoCOP = Math.round((livePrice * stock.Cantidad * factorTRM) * 100) / 100;\n  const costoBaseCOP = Math.round((stock.costoOrigen * factorTRM) * 100) / 100;\n\n  processedList.push({\n    json: {\n      fechaHora,\n      Ticker: stock.Ticker,\n      DIR_COTIZACION: stock.DIR_COTIZACION,\n      Nombre: stock.Nombre,\n      Mercado: stock.Mercado,\n      Moneda: stock.Moneda,\n      livePrice,\n      prevClose,\n      variacionDivisa,\n      variacionPct,\n      volumen,\n      Cantidad: stock.Cantidad,\n      valorMercadoCOP,\n      costoBaseCOP\n    }\n  });\n}\n\nreturn processedList;"
+      },
+      "id": "node-process-metrics",
+      "name": "4. Procesar Métricas y Bimoneda",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 300]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Mapeo para Portafolio_Base: Col J ('Precio Mercado Actual') y Col S ('Variación Día (%)')\nconst items = $input.all();\n\nreturn items.map(item => ({\n  json: {\n    Ticker: item.json.Ticker,\n    'Precio Mercado Actual': item.json.livePrice,\n    'Variación Día (%)': item.json.variacionPct\n  }\n}));"
+      },
+      "id": "node-map-portafolio",
+      "name": "Preparar Portafolio_Base",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 160]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "mode": "id",
+          "value": "TU_GOOGLE_SHEET_ID_AQUI"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Portafolio_Base"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "matchingColumns": [
+            "Ticker"
+          ]
+        },
+        "options": {}
+      },
+      "id": "node-update-portafolio",
+      "name": "Actualizar Portafolio_Base",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1400, 160],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REEMPLAZAR_CON_TU_CREDENTIAL_ID_GOOGLE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Mapeo para Historico_Precios_Activos (9 columnas requeridas)\nconst items = $('4. Procesar Métricas y Bimoneda').all();\n\nreturn items.map(item => ({\n  json: {\n    'Fecha y Hora': item.json.fechaHora,\n    'Ticker': item.json.Ticker,\n    'Nombre': item.json.Nombre,\n    'Mercado': item.json.Mercado,\n    'Precio Actual (COP)': item.json.livePrice,\n    'Cierre Previo (COP)': item.json.prevClose,\n    'Variación Día (COP)': item.json.variacionDivisa,\n    'Variación Día (%)': item.json.variacionPct,\n    'Volumen': item.json.volumen\n  }\n}));"
+      },
+      "id": "node-map-activos",
+      "name": "Preparar Historico_Precios_Activos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 320]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "mode": "id",
+          "value": "TU_GOOGLE_SHEET_ID_AQUI"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Historico_Precios_Activos"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        },
+        "options": {}
+      },
+      "id": "node-append-activos",
+      "name": "Insertar en Historico_Precios_Activos",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1400, 320],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REEMPLAZAR_CON_TU_CREDENTIAL_ID_GOOGLE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Mapeo para Historico_Snapshots (Consolidado Patrimonial Homogéneo en COP)\nconst items = $('4. Procesar Métricas y Bimoneda').all();\n\n// Ajustar estos saldos fijos de ser necesario\nconst FONDOS_TRII_COP = 0.00;\nconst EFECTIVO_DISPONIBLE_COP = 0.00;\n\nlet totalInversionInicialCOP = 0;\nlet totalValorMercadoCOP = 0;\n\nfor (const i of items) {\n  const d = i.json;\n  totalInversionInicialCOP += d.costoBaseCOP;\n  totalValorMercadoCOP += d.valorMercadoCOP;\n}\n\ntotalInversionInicialCOP = Math.round(totalInversionInicialCOP * 100) / 100;\ntotalValorMercadoCOP = Math.round(totalValorMercadoCOP * 100) / 100;\nconst patrimonioTotalCOP = Math.round((totalValorMercadoCOP + FONDOS_TRII_COP + EFECTIVO_DISPONIBLE_COP) * 100) / 100;\nconst rendimientoPct = Math.round(((totalValorMercadoCOP - totalInversionInicialCOP) / totalInversionInicialCOP) * 10000) / 10000;\n\nconst fechaHora = items[0].json.fechaHora;\n\nreturn [{\n  json: {\n    'Fecha y Hora': fechaHora,\n    'Inversión Inicial (COP)': totalInversionInicialCOP,\n    'Valor Mercado Acciones/ETFs (COP)': totalValorMercadoCOP,\n    'Fondos Trii (COP)': FONDOS_TRII_COP,\n    'Saldo Efectivo (COP)': EFECTIVO_DISPONIBLE_COP,\n    'Patrimonio Total (COP)': patrimonioTotalCOP,\n    'Rendimiento %': rendimientoPct\n  }\n}];"
+      },
+      "id": "node-map-snapshot",
+      "name": "Preparar Historico_Snapshots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1180, 480]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "mode": "id",
+          "value": "TU_GOOGLE_SHEET_ID_AQUI"
+        },
+        "sheetName": {
+          "mode": "name",
+          "value": "Historico_Snapshots"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData"
+        },
+        "options": {}
+      },
+      "id": "node-append-snapshot",
+      "name": "Insertar en Historico_Snapshots",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1400, 480],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REEMPLAZAR_CON_TU_CREDENTIAL_ID_GOOGLE",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ═══════════════════════════════════════════════════════════\n// CONSTRUCCIÓN DEL MENSAJE EJECUTIVO PARA TELEGRAM (BIMONEDA)\n// ═══════════════════════════════════════════════════════════\n\nconst snap = $('Preparar Historico_Snapshots').first().json;\nconst metrics = $('4. Procesar Métricas y Bimoneda').all().map(i => i.json);\n\nconst fmtCOP = (val) => '$ ' + Math.round(val).toLocaleString('es-CO');\nconst fmtPct = (val) => (val >= 0 ? '+' : '') + (val * 100).toFixed(2) + '%';\n\n// Ordenar por variación diaria\nconst ordenados = [...metrics].sort((a, b) => b.variacionPct - a.variacionPct);\nconst topGanadora = ordenados[0];\nconst topPerdedora = ordenados[ordenados.length - 1];\n\n// Activos en USD para reporte especial\nconst activosUSD = metrics.filter(m => m.Moneda === 'USD');\nconst resumenUSD = activosUSD.map(a => `• <b>${a.Ticker}:</b> $${a.livePrice} USD (${fmtPct(a.variacionPct)})`).join('\\n');\n\nconst texto = `📊 <b>Monitoreo Portafolio Trii, BVC & USA</b>\n🕒 <i>${snap['Fecha y Hora']}</i>\n━━━━━━━━━━━━━━━━━━━━━━\n💰 <b>Patrimonio Total:</b> <code>${fmtCOP(snap['Patrimonio Total (COP)'])}</code>\n📈 <b>Rendimiento Consolidado:</b> <b>${fmtPct(snap['Rendimiento %'])}</b>\n\n💼 <b>Acciones/ETFs:</b> ${fmtCOP(snap['Valor Mercado Acciones/ETFs (COP)'])} COP\n🏦 <b>Fondos:</b> ${fmtCOP(snap['Fondos Trii (COP)'])} COP\n🪙 <b>Saldo Efectivo:</b> ${fmtCOP(snap['Saldo Efectivo (COP)'])} COP\n━━━━━━━━━━━━━━━━━━━━━━\n🇺🇸 <b>Mercado USA (Dólares):</b>\n${resumenUSD || '• Sin posiciones USD'}\n━━━━━━━━━━━━━━━━━━━━━━\n🚀 <b>Top Subida Hoy:</b> ${topGanadora.Ticker} (<b>${fmtPct(topGanadora.variacionPct)}</b>)\n🔻 <b>Mayor Caída Hoy:</b> ${topPerdedora.Ticker} (<b>${fmtPct(topPerdedora.variacionPct)}</b>)\n━━━━━━━━━━━━━━━━━━━━━━\n✅ <i>Google Sheets actualizado exitosamente.</i>`;\n\nreturn [{\n  json: {\n    chatId: 'TU_TELEGRAM_CHAT_ID_AQUI',\n    mensaje: texto\n  }\n}];"
+      },
+      "id": "node-build-telegram",
+      "name": "Formatear Mensaje Telegram",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1620, 480]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.mensaje }}",
+        "additionalFields": {
+          "parse_mode": "HTML"
+        }
+      },
+      "id": "node-send-telegram",
+      "name": "Enviar Alerta Telegram",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [1840, 480],
+      "credentials": {
+        "telegramApi": {
+          "id": "REEMPLAZAR_CON_TU_CREDENTIAL_ID_TELEGRAM",
+          "name": "Telegram account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Trigger Horario (L-V 8-16 COT)": {
+      "main": [
+        [
+          {
+            "node": "1. Leer Portafolio_Base (Dinamico)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "1. Leer Portafolio_Base (Dinamico)": {
+      "main": [
+        [
+          {
+            "node": "2. Preparar Consultas Yahoo",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "2. Preparar Consultas Yahoo": {
+      "main": [
+        [
+          {
+            "node": "3. Consultar Yahoo Finance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "3. Consultar Yahoo Finance": {
+      "main": [
+        [
+          {
+            "node": "4. Procesar Métricas y Bimoneda",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "4. Procesar Métricas y Bimoneda": {
+      "main": [
+        [
+          {
+            "node": "Preparar Portafolio_Base",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Preparar Historico_Precios_Activos",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Preparar Historico_Snapshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Portafolio_Base": {
+      "main": [
+        [
+          {
+            "node": "Actualizar Portafolio_Base",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Historico_Precios_Activos": {
+      "main": [
+        [
+          {
+            "node": "Insertar en Historico_Precios_Activos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Preparar Historico_Snapshots": {
+      "main": [
+        [
+          {
+            "node": "Insertar en Historico_Snapshots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Insertar en Historico_Snapshots": {
+      "main": [
+        [
+          {
+            "node": "Formatear Mensaje Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Formatear Mensaje Telegram": {
+      "main": [
+        [
+          {
+            "node": "Enviar Alerta Telegram",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Bogota",
+    "saveExecutionProgress": true,
+    "callerPolicy": "workflowsFromSameOwner"
+  }
+}
